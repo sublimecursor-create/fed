@@ -2,6 +2,13 @@
 # Fedora the Arch way installer. Functions are added per task, then arranged later.
 set -euo pipefail
 
+MNT=/mnt
+DISK=
+EFI_PART=
+LINUX_PART=
+LUKS_NAME=system
+VG_NAME=fedora
+
 configure_dnf() {
   local conf=/etc/dnf/dnf.conf
   mkdir -p /etc/dnf
@@ -39,9 +46,9 @@ partition_disk() {
   sgdisk --clear "$DISK"
   sgdisk -n "1:0:+${efi_size}" -t 1:ef00 -c 1:EFI "$DISK"
   if [[ "$root_size" == "100%" ]]; then
-    sgdisk -n 2:0:0 -t 2:8304 -c 2:Linux "$DISK"
+    sgdisk -n 2:0:0 -t 2:8309 -c 2:Linux "$DISK"
   else
-    sgdisk -n "2:0:+${root_size}" -t 2:8304 -c 2:Linux "$DISK"
+    sgdisk -n "2:0:+${root_size}" -t 2:8309 -c 2:Linux "$DISK"
   fi
   partprobe "$DISK"
   udevadm settle
@@ -56,7 +63,6 @@ partition_disk() {
 
 encrypt_linux() {
   command -v cryptsetup >/dev/null || dnf install -y cryptsetup
-  sgdisk -t 2:8309 "$DISK"
 
   cryptsetup luksFormat \
     --type luks2 \
@@ -73,13 +79,13 @@ encrypt_linux() {
     --perf-no_read_workqueue \
     --perf-no_write_workqueue \
     "$LINUX_PART" \
-    system
+    "$LUKS_NAME"
 }
 
 setup_lvm() {
   command -v pvcreate >/dev/null || dnf install -y lvm2
-  pvcreate /dev/mapper/system
-  vgcreate fedora /dev/mapper/system
+  pvcreate "/dev/mapper/${LUKS_NAME}"
+  vgcreate "$VG_NAME" "/dev/mapper/${LUKS_NAME}"
 
   echo
   read -r -p "root LV size (e.g. 40G, or 100% for remaining): " lv_root_size
@@ -89,9 +95,9 @@ setup_lvm() {
   create_lv() {
     local name="$1" size="$2"
     if [[ "$size" == "100%" || "$size" == "100%FREE" ]]; then
-      lvcreate -y -l 100%FREE -n "$name" fedora
+      lvcreate -y -l 100%FREE -n "$name" "$VG_NAME"
     else
-      lvcreate -y -L "$size" -n "$name" fedora
+      lvcreate -y -L "$size" -n "$name" "$VG_NAME"
     fi
   }
 
@@ -103,22 +109,20 @@ setup_lvm() {
 format_filesystems() {
   command -v mkfs.vfat >/dev/null || dnf install -y dosfstools e2fsprogs
   mkfs.vfat -F 32 -n BOOT "$EFI_PART"
-  mkfs.ext4 -L Root /dev/fedora/root
-  mkfs.ext4 -L Home /dev/fedora/home
-  mkswap -L Swap /dev/fedora/swap
+  mkfs.ext4 -L Root "/dev/${VG_NAME}/root"
+  mkfs.ext4 -L Home "/dev/${VG_NAME}/home"
+  mkswap -L Swap "/dev/${VG_NAME}/swap"
 }
 
 mount_filesystems() {
-  MNT=/mnt
-  mount /dev/fedora/root "$MNT"
+  mount "/dev/${VG_NAME}/root" "$MNT"
   mkdir -p "$MNT/home" "$MNT/boot/efi"
-  mount /dev/fedora/home "$MNT/home"
+  mount "/dev/${VG_NAME}/home" "$MNT/home"
   mount -o umask=0077 "$EFI_PART" "$MNT/boot/efi"
-  swapon /dev/fedora/swap
+  swapon "/dev/${VG_NAME}/swap"
 }
 
 mount_api_filesystems() {
-  MNT="${MNT:-/mnt}"
   mkdir -p "$MNT"/{dev,proc,sys}
   mount --rbind /dev "$MNT/dev"
   mount --make-rslave "$MNT/dev"
@@ -127,14 +131,13 @@ mount_api_filesystems() {
 }
 
 write_cmdline_and_crypttab() {
-  MNT="${MNT:-/mnt}"
   local luks_uuid
   luks_uuid=$(blkid -s UUID -o value "$LINUX_PART")
 
   # /etc/kernel/cmdline — consumed by dracut / systemd-ukify when building UKIs
   mkdir -p "$MNT/etc/kernel"
-  printf 'rd.luks.uuid=%s rd.lvm.lv=fedora/root rd.lvm.lv=fedora/swap root=/dev/mapper/fedora-root rootfstype=ext4 rootflags=ro,realtime\n' \
-    "$luks_uuid" > "$MNT/etc/kernel/cmdline"
+  printf 'rd.luks.uuid=%s rd.lvm.lv=%s/root rd.lvm.lv=%s/swap root=/dev/mapper/%s-root rootfstype=ext4 rootflags=ro,relatime\n' \
+    "$luks_uuid" "$VG_NAME" "$VG_NAME" "$VG_NAME" > "$MNT/etc/kernel/cmdline"
 
   # /etc/kernel/install.conf — kernel-install configuration for UKI generation
   cat <<'EOF' > "$MNT/etc/kernel/install.conf"
@@ -147,8 +150,8 @@ EOF
   # /etc/crypttab — tells systemd-cryptsetup to unlock at boot
   # Format: <name>  <device>            <keyfile>  <options>
   mkdir -p "$MNT/etc"
-  printf 'system  UUID=%s  none  luks,x-initrd.attach\n' \
-    "$luks_uuid" > "$MNT/etc/crypttab"
+  printf '%s  UUID=%s  none  luks,x-initrd.attach\n' \
+    "$LUKS_NAME" "$luks_uuid" > "$MNT/etc/crypttab"
 
   echo "[+] Wrote kernel cmdline       -> $MNT/etc/kernel/cmdline"
   echo "[+] Wrote kernel install.conf  -> $MNT/etc/kernel/install.conf"
@@ -156,7 +159,6 @@ EOF
 }
 
 bootstrap() {
-  MNT="${MNT:-/mnt}"
   dnf --installroot="$MNT" \
     --use-host-config \
     --releasever=44 \
@@ -266,10 +268,13 @@ bootstrap() {
 }
 
 configure_chroot() {
-  genfstab -U /mnt > /mnt/etc/fstab
-  cp "$(dirname "$0")/nvidia.sh" /mnt/nvidia.sh 2>/dev/null || true
-  chmod +x /mnt/nvidia.sh /mnt/root/nvidia.sh 2>/dev/null || true
-  arch-chroot -S /mnt
+  local here
+  here="$(dirname "$0")"
+  genfstab -U "$MNT" > "$MNT/etc/fstab"
+  cp "$here/nvidia.sh" "$MNT/nvidia.sh" 2>/dev/null || true
+  cp "$here/setup.sh" "$MNT/setup.sh"
+  chmod +x "$MNT/nvidia.sh" "$MNT/setup.sh" 2>/dev/null || true
+  arch-chroot "$MNT" /setup.sh
 }
 main() {
   configure_dnf
